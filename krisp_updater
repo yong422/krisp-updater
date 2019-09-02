@@ -1,0 +1,240 @@
+#!/usr/bin/env python
+#-*-coding:utf-8-*-
+
+"""
+@auth       ykjo
+@date       2016-10-15
+@file       krispupdater
+@build      3
+@brief      libkrisp 사용을위한 DB파일을 업데이트하기위한 스크립트데몬.
+            open 시 업데이트와 중복될수있으므로 lock파일로 잠금후 업데이트.
+            이미 open하여 사용중일경우 지워도 문제되진 않는다.
+            전역변수 문자열은 krisp_updater_conf.py 파일에 별도 정의되어 있으므로 필요에맞게 수정
+@history
+            build 1
+                최초작성.
+            build 2
+                전역변수 분리.
+                krisp(non geoip)만으로 dat 파일 생성하는 옵션추가
+            build 3
+                import 오류수정
+                메일 내용오류수정
+"""
+
+import sys
+import os
+sys.path.append('/usr/lib/python2.7/site-packages')
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), './'))
+import time
+import subprocess
+import shutil
+
+from krisp_updater_conf import _KRISP_FILEURL
+from krisp_updater_conf import _TARGET_GZ
+from krisp_updater_conf import _TARGET_CSV
+from krisp_updater_conf import _CREATE_CMD
+from krisp_updater_conf import _DIR_KRISPDATA
+from krisp_updater_conf import _MY_IDCNAME
+from krisp_updater_conf import _UPDATE_CYCLE
+
+# 다음의 import에서 에러가 날경우 pip install 로 설치하도록 한다.
+try:
+    import wget
+    import gzip
+    import logging
+    import logging.handlers
+    from SendMail import SendMail
+except IOError, e:
+    print str(e)
+    sys.exit()
+from subprocess import Popen, PIPE
+
+# logging set
+g_logger = logging.getLogger("krispupdater")
+g_logger.setLevel(logging.INFO)
+g_formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] [line:%(lineno)s] : %(message)s')
+
+g_fileMaxByte = 1024 * 1024 * 1 # 10MB
+g_fileHandler = logging.handlers.RotatingFileHandler('./krispupdater.log', maxBytes=g_fileMaxByte, backupCount=2)
+g_streamHandler = logging.StreamHandler()
+
+g_fileHandler.setFormatter(g_formatter)
+g_streamHandler.setFormatter(g_formatter)
+g_logger.addHandler(g_fileHandler)
+g_logger.addHandler(g_streamHandler)
+
+
+def Usage():
+    print ''
+    print 'Usage: ' + procname + ' [option]'
+    print ' option'
+    print '         --start   : daemon start'
+    print '         --stop    : daemon stop'
+    print '         --restart : daemon restart'
+    sys.exit()
+
+def Restart(procname):
+    Stop(procname, False)
+    Start(procname)
+
+def Stop(procname, flag_exit=True):
+    filen_pid = procname+'.pid'
+    if os.path.isfile(filen_pid) == False:
+        print procname+' process is not running...\n'
+        if flag_exit:
+            sys.exit()
+        else:
+            return True
+    else:
+        pid_file = open(filen_pid,'r')
+        line = pid_file.read()
+        kill_string ='kill -9 '+str(line)
+        os.system(kill_string)
+        os.remove(filen_pid)
+        g_logger.info("%s process stopped...." % (procname))
+        if flag_exit:
+            sys.exit()
+        else:
+            return True
+
+def Start(procname):
+    filen_pid = procname+'.pid'
+    if os.path.isfile(filen_pid):
+        print procname+' process is running...\n'
+        sys.exit()
+    else:
+        g_logger.info("%s daemon start..." % (procname))
+        pid = os.getpid()
+        pid_file = open(filen_pid, 'w')
+        pid_file.write(str(pid))
+        pid_file.close()
+        Run(procname)
+
+
+def Run(procname):
+    ToDo()
+    Stop(procname)
+
+def ToDo():
+    cnt=0
+    while True:
+        if Download():
+            g_logger.info(_TARGET_GZ+" file download success")
+            if CreateCSVFile():
+                g_logger.info(_TARGET_CSV+" file create success")
+                if CreateDBFile():
+                    g_logger.info("krisp.dat database file create success")
+                    MoveDataFile()
+              
+        SendLogMail()
+        time.sleep(_UPDATE_CYCLE)
+
+def SendLogMail():
+    sm = SendMail()
+    sm.Clear()
+    # 로그메일 발송을위한 smtp 설정
+    sm.SetUseSmtp(host="smtp.server.com", port=25 )
+    sm.SetSmtpFrom("myadmin@admin.com")
+    try:
+        sm.SetTitle("KRISP 데이터베이스 업데이트")
+        sm.SetText("IDC NAME : "+_MY_IDCNAME)
+        sm.AddText("업데이트 성공 또는 실패는 log파일을 확인하십시오.")
+        # 메일을 수신할 대상의 메일주소 추가. 
+        sm.AddTargetMail("myadmin@admin.com")
+        # 메일에 첨부할 파일추가.
+        sm.AddSendFile("krispupdater.log")
+        sm.Send()
+    except Exception, ex:
+        g_logger.error(str(ex))
+        g_logger.error(sys.exc_info()[0])
+
+def Download():
+    url = _KRISP_FILEURL
+    try:
+        filename = wget.download(url)
+        return True
+    except Exception, e:
+        print str(e)
+        return False
+
+def CreateCSVFile():
+    # 다운로드된 gz 파일을 csv파일로 변환한다.
+    with gzip.open(_TARGET_GZ, 'rb') as f_in, file(_TARGET_CSV, 'wb') as f_out :
+        readfile = f_in.read()
+        f_out.write(readfile)
+        f_in.close()
+        f_out.close()
+        os.remove(_TARGET_GZ)
+        return True
+    return False
+
+def CreateDBFile():
+    # db파일을 생성한다.
+    if os.path.isfile("./krisp.dat"):
+        os.remove("./krisp.dat")
+    p = subprocess.Popen(_CREATE_CMD, shell=True, stdout = subprocess.PIPE, stderr=subprocess.PIPE)
+    out = p.stdout.readlines()
+    out_err = p.stderr.readlines()
+    if len(out_err):
+        g_logger.error(str(out_err))
+        return False
+    os.remove(_TARGET_CSV)
+    return True
+
+def MoveDataFile():
+    # 생성된 dat 파일을 krisp library 디렉토리로 복사.
+    if CreateLock():
+        try :
+            os.remove(_DIR_KRISPDATA+"krisp.dat.bak")
+        except OSError, e:
+            g_logger.error(str(e))
+        try:
+            os.rename(_DIR_KRISPDATA+"krisp.dat", _DIR_KRISPDATA+"krisp.dat.bak")
+        except OSError, e:
+            g_logger.error(str(e))
+
+        shutil.move("./krisp.dat", _DIR_KRISPDATA+"krisp.dat")
+        if os.path.isfile(_DIR_KRISPDATA+"krisp.dat"):
+            os.chmod(_DIR_KRISPDATA+"krisp.dat", 0755)
+            g_logger.info("krisp update success")
+        else:
+            os.rename(_DIR_KRISPDATA+"krisp.dat.bak", _DIR_KRISPDATA+"krisp.dat")
+            g_logger.error("krisp rollback")
+
+        DeleteLock()
+        return True 
+
+    return False
+    
+def CreateLock():
+    # daemon 접근을 방지하기위한 락파일 생성.
+    with file(_DIR_KRISPDATA+"lock", "w") as lockFile:
+        lockFile.write("1")
+        lockFile.close()
+        g_logger.info("libkrisp lock")
+        return True
+    return False
+
+def DeleteLock():   
+    # daemon 접근방지 락해제.
+    os.remove(_DIR_KRISPDATA+"lock")
+    g_logger.info("libkrisp unlock")
+
+if __name__ == "__main__":
+    procname = sys.argv[0]
+    procname = procname.replace('./','')
+    filen_pid = procname+'.pid'
+    if os.fork() == 0:
+        if len(sys.argv) > 1:
+            if sys.argv[1] == "--start":
+                Start(procname)
+            elif sys.argv[1] == "--stop":
+                Stop(procname)
+            elif sys.argv[1] == "--kill":
+                Stop(procname)
+            elif sys.argv[1] == "--restart":
+                Restart(procname)
+            else:
+                Usage()
+        else:
+            Usage()
